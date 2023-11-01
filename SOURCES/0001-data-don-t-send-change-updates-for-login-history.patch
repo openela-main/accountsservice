@@ -1,0 +1,88 @@
+From 50edc5e45bb984576506e7b2bfb4c267ac566099 Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Thu, 9 May 2019 14:58:34 -0400
+Subject: [PATCH] data: don't send change updates for login-history
+
+The login-history property of user objects can be quite large.
+If wtmp is changed frequently, that can lead to memory fragmentation
+in clients.
+
+Furthermore, most clients never check login-history, so it's
+wasted memory and wasted cpu.
+
+This commit disables change notification for that property.  If
+a client really needs to get updates, they can manually refresh
+their cache when appropriate.
+---
+ data/org.freedesktop.Accounts.User.xml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/data/org.freedesktop.Accounts.User.xml b/data/org.freedesktop.Accounts.User.xml
+index 8d3fe1c..3b839a3 100644
+--- a/data/org.freedesktop.Accounts.User.xml
++++ b/data/org.freedesktop.Accounts.User.xml
+@@ -785,60 +785,61 @@
+     <doc:doc>
+       <doc:description>
+         <doc:para>
+           The users location.
+         </doc:para>
+       </doc:description>
+     </doc:doc>
+   </property>
+ 
+   <property name="LoginFrequency" type="t" access="read">
+     <doc:doc>
+       <doc:description>
+         <doc:para>
+           How often the user has logged in.
+         </doc:para>
+       </doc:description>
+     </doc:doc>
+   </property>
+ 
+   <property name="LoginTime" type="x" access="read">
+     <doc:doc>
+       <doc:description>
+         <doc:para>
+           The last login time.
+         </doc:para>
+       </doc:description>
+     </doc:doc>
+   </property>
+ 
+   <property name="LoginHistory" type="a(xxa{sv})" access="read">
++    <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="false"/>
+     <doc:doc>
+       <doc:description>
+         <doc:para>
+           The login history for this user.
+           Each entry in the array represents a login session. The first two
+           members are the login time and logout time, as timestamps (seconds since the epoch). If the session is still running, the logout time
+           is 0.
+         </doc:para>
+         <doc:para>
+           The a{sv} member is a dictionary containing additional information
+           about the session. Possible members include 'type' (with values like ':0', 'tty0', 'pts/0' etc).
+         </doc:para>
+       </doc:description>
+     </doc:doc>
+   </property>
+ 
+   <property name="IconFile" type="s" access="read">
+     <doc:doc>
+       <doc:description>
+         <doc:para>
+            The filename of a png file containing the users icon.
+         </doc:para>
+       </doc:description>
+     </doc:doc>
+   </property>
+ 
+   <property name="Saved" type="b" access="read">
+     <doc:doc>
+       <doc:description>
+         <doc:para>
+-- 
+2.27.0
+

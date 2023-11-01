@@ -1,0 +1,894 @@
+From 5124220f12a157ff285072a4f786db2c94c3ca8a Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Thu, 14 Jan 2021 15:07:34 -0500
+Subject: [PATCH] lib: save os when creating user
+
+In order to identify that a user has upgraded from rhel 7 to
+rhel 8, we need to know what os they were using when created.
+
+This commit saves that information using a red hat specific
+extension to accountsservice.
+---
+ .../com.redhat.AccountsServiceUser.System.xml |  10 ++
+ data/meson.build                              |   1 +
+ meson.build                                   |   1 +
+ meson_post_install.py                         |  15 +++
+ src/libaccountsservice/act-user-manager.c     | 123 ++++++++++++++++++
+ src/libaccountsservice/meson.build            |   7 +
+ 6 files changed, 157 insertions(+)
+ create mode 100644 data/com.redhat.AccountsServiceUser.System.xml
+
+diff --git a/data/com.redhat.AccountsServiceUser.System.xml b/data/com.redhat.AccountsServiceUser.System.xml
+new file mode 100644
+index 0000000..67f5f30
+--- /dev/null
++++ b/data/com.redhat.AccountsServiceUser.System.xml
+@@ -0,0 +1,10 @@
++<node>
++  <interface name="com.redhat.AccountsServiceUser.System">
++
++    <annotation name="org.freedesktop.Accounts.VendorExtension" value="true"/>
++
++    <property name="id" type="s" access="readwrite"/>
++    <property name="version-id" type="s" access="readwrite"/>
++
++  </interface>
++</node>
+diff --git a/data/meson.build b/data/meson.build
+index 4987937..2dc57c2 100644
+--- a/data/meson.build
++++ b/data/meson.build
+@@ -1,33 +1,34 @@
+ ifaces = files(
+   act_namespace + '.xml',
+   act_namespace + '.User.xml',
++  'com.redhat.AccountsServiceUser.System.xml',
+ )
+ 
+ install_data(
+   ifaces,
+   install_dir: dbus_ifaces_dir,
+ )
+ 
+ install_data(
+   act_namespace + '.conf',
+   install_dir: dbus_conf_dir,
+ )
+ 
+ service_conf = configuration_data()
+ service_conf.set('libexecdir', act_libexecdir)
+ 
+ service = act_namespace + '.service'
+ 
+ configure_file(
+   input: service + '.in',
+   output: service,
+   configuration: service_conf,
+   install: true,
+   install_dir: dbus_sys_dir,
+ )
+ 
+ policy = act_namespace.to_lower() + '.policy'
+ 
+ i18n.merge_file(
+   policy,
+   input: policy + '.in',
+diff --git a/meson.build b/meson.build
+index 4465a26..e37c451 100644
+--- a/meson.build
++++ b/meson.build
+@@ -174,38 +174,39 @@ assert(not enable_systemd or not enable_elogind, 'systemd and elogind support re
+ if enable_systemd
+   logind_dep = dependency('libsystemd', version: '>= 186')
+ endif
+ 
+ if enable_elogind
+   logind_dep = dependency('libelogind', version: '>= 229.4')
+ endif
+ config_h.set('WITH_SYSTEMD', enable_systemd or enable_elogind)
+ 
+ subdir('data')
+ subdir('src')
+ subdir('po')
+ 
+ enable_docbook = get_option('docbook')
+ if enable_docbook
+   subdir('doc/dbus')
+ endif
+ 
+ if get_option('gtk_doc')
+   subdir('doc/libaccountsservice')
+ endif
+ 
+ configure_file(
+   output: 'config.h',
+   configuration: config_h,
+ )
+ 
+ meson.add_install_script(
+   'meson_post_install.py',
+   act_localstatedir,
++  act_datadir,
+ )
+ 
+ output = '\n' + meson.project_name() + ' was configured with the following options:\n'
+ output += '** DocBook documentation build: ' + enable_docbook.to_string() + '\n'
+ output += '** Administrator group: ' + admin_group + '\n'
+ output += '** Extra administrator groups: ' + extra_admin_groups + '\n'
+ output += '** GDM configuration: ' + gdm_conf_file
+ message(output)
+diff --git a/meson_post_install.py b/meson_post_install.py
+index 5cc2dc4..e1d5a71 100644
+--- a/meson_post_install.py
++++ b/meson_post_install.py
+@@ -1,18 +1,33 @@
+ #!/usr/bin/env python3
+ 
+ import os
+ import sys
+ 
+ destdir = os.environ.get('DESTDIR', '')
+ localstatedir = os.path.normpath(destdir + os.sep + sys.argv[1])
++datadir = os.path.normpath(destdir + os.sep + sys.argv[2])
++interfacedir = os.path.join(datadir, 'accountsservice', 'interfaces')
+ 
+ # FIXME: meson will not track the creation of these directories
+ #        https://github.com/mesonbuild/meson/blob/master/mesonbuild/scripts/uninstall.py#L39
+ dst_dirs = [
+   (os.path.join(localstatedir, 'lib', 'AccountsService', 'icons'), 0o775),
+   (os.path.join(localstatedir, 'lib', 'AccountsService', 'users'), 0o700),
++  (interfacedir, 0o775),
+ ]
+ 
+ for (dst_dir, dst_dir_mode) in dst_dirs:
+   if not os.path.exists(dst_dir):
+     os.makedirs(dst_dir, mode=dst_dir_mode)
++
++interface_files = [
++  'com.redhat.AccountsServiceUser.System.xml',
++]
++
++for interface_file in interface_files:
++    src_path = os.path.join('../../dbus-1/interfaces', interface_file)
++    dst_path = os.path.join(interfacedir, interface_file)
++    if not os.path.exists(dst_path):
++        os.symlink(src_path, dst_path)
++
++
+diff --git a/src/libaccountsservice/act-user-manager.c b/src/libaccountsservice/act-user-manager.c
+index 1b5298d..f4598c4 100644
+--- a/src/libaccountsservice/act-user-manager.c
++++ b/src/libaccountsservice/act-user-manager.c
+@@ -27,60 +27,61 @@
+ #include <string.h>
+ #include <signal.h>
+ #include <errno.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ 
+ #ifdef HAVE_PATHS_H
+ #include <paths.h>
+ #endif /* HAVE_PATHS_H */
+ 
+ #include <glib.h>
+ #include <glib/gi18n-lib.h>
+ #include <glib/gstdio.h>
+ #include <glib-object.h>
+ #include <gio/gio.h>
+ #include <gio/gunixinputstream.h>
+ 
+ #ifdef WITH_SYSTEMD
+ #include <systemd/sd-login.h>
+ 
+ /* check if logind is running */
+ #define LOGIND_RUNNING() (access("/run/systemd/seats/", F_OK) >= 0)
+ #endif
+ 
+ #include "act-user-manager.h"
+ #include "act-user-private.h"
+ #include "accounts-generated.h"
+ #include "ck-manager-generated.h"
+ #include "ck-seat-generated.h"
+ #include "ck-session-generated.h"
++#include "com.redhat.AccountsServiceUser.System.h"
+ 
+ /**
+  * SECTION:act-user-manager
+  * @title: ActUserManager
+  * @short_description: manages ActUser objects
+  *
+  * ActUserManager is a manager object that gives access to user
+  * creation, deletion, enumeration, etc.
+  *
+  * There is typically a singleton ActUserManager object, which
+  * can be obtained by act_user_manager_get_default().
+  */
+ 
+ /**
+  * ActUserManager:
+  *
+  * A user manager object.
+  */
+ 
+ /**
+  * ACT_USER_MANAGER_ERROR:
+  *
+  * The GError domain for #ActUserManagerError errors
+  */
+ 
+ /**
+  * ActUserManagerError:
+  * @ACT_USER_MANAGER_ERROR_FAILED: Generic failure
+  * @ACT_USER_MANAGER_ERROR_USER_EXISTS: The user already exists
+  * @ACT_USER_MANAGER_ERROR_USER_DOES_NOT_EXIST: The user does not exist
+@@ -165,60 +166,63 @@ typedef struct
+         ActUser                    *user;
+         ActUserManagerFetchUserRequestType type;
+         union {
+                 char               *username;
+                 uid_t               uid;
+         };
+         char                       *object_path;
+         char                       *description;
+ } ActUserManagerFetchUserRequest;
+ 
+ typedef struct
+ {
+         GHashTable            *normal_users_by_name;
+         GHashTable            *system_users_by_name;
+         GHashTable            *users_by_object_path;
+         GHashTable            *sessions;
+         GDBusConnection       *connection;
+         AccountsAccounts      *accounts_proxy;
+         ConsoleKitManager     *ck_manager_proxy;
+ 
+         ActUserManagerSeat     seat;
+ 
+         GSList                *new_sessions;
+         GSList                *new_users;
+         GSList                *new_users_inhibiting_load;
+         GSList                *fetch_user_requests;
+ 
+         GSList                *exclude_usernames;
+         GSList                *include_usernames;
+ 
++        char                  *os_id;
++        char                  *os_version_id;
++
+         guint                  load_id;
+ 
+         gboolean               is_loaded;
+         gboolean               has_multiple_users;
+         gboolean               getting_sessions;
+         gboolean               list_cached_users_done;
+ } ActUserManagerPrivate;
+ 
+ enum {
+         PROP_0,
+         PROP_INCLUDE_USERNAMES_LIST,
+         PROP_EXCLUDE_USERNAMES_LIST,
+         PROP_IS_LOADED,
+         PROP_HAS_MULTIPLE_USERS
+ };
+ 
+ enum {
+         USER_ADDED,
+         USER_REMOVED,
+         USER_IS_LOGGED_IN_CHANGED,
+         USER_CHANGED,
+         LAST_SIGNAL
+ };
+ 
+ static guint signals [LAST_SIGNAL] = { 0, };
+ 
+ static void     act_user_manager_class_init (ActUserManagerClass *klass);
+ static void     act_user_manager_init       (ActUserManager      *user_manager);
+ static void     act_user_manager_finalize   (GObject             *object);
+ 
+@@ -2942,100 +2946,173 @@ ensure_accounts_proxy (ActUserManager *manager)
+                                                                  G_DBUS_PROXY_FLAGS_NONE,
+                                                                  ACCOUNTS_NAME,
+                                                                  ACCOUNTS_PATH,
+                                                                  NULL,
+                                                                  &error);
+         if (error != NULL) {
+                 g_debug ("ActUserManager: getting account proxy failed: %s", error->message);
+                 return FALSE;
+         }
+ 
+         g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (priv->accounts_proxy), G_MAXINT);
+ 
+         g_object_bind_property (G_OBJECT (priv->accounts_proxy),
+                                 "has-multiple-users",
+                                 G_OBJECT (manager),
+                                 "has-multiple-users",
+                                 G_BINDING_SYNC_CREATE);
+ 
+         g_signal_connect (priv->accounts_proxy,
+                           "user-added",
+                           G_CALLBACK (on_new_user_in_accounts_service),
+                           manager);
+         g_signal_connect (priv->accounts_proxy,
+                           "user-deleted",
+                           G_CALLBACK (on_user_removed_in_accounts_service),
+                           manager);
+ 
+         return TRUE;
+ }
+ 
++static inline gboolean
++is_valid_char (gchar    c,
++               gboolean first)
++{
++        return (!first && g_ascii_isdigit (c)) ||
++                c == '_' ||
++                g_ascii_isalpha (c);
++}
++
++static void
++load_os_release (ActUserManager *manager)
++{
++        ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
++        g_autoptr(GFile) file = NULL;
++        g_autoptr(GError) error = NULL;
++        g_autofree char *contents = NULL;
++        g_auto(GStrv) lines = NULL;
++        size_t i;
++
++        file = g_file_new_for_path ("/etc/os-release");
++
++        if (!g_file_load_contents (file, NULL, &contents, NULL, NULL, &error)) {
++                g_debug ("ActUserManager: couldn't load /etc/os-release: %s", error->message);
++                return;
++        }
++
++        lines = g_strsplit (contents, "\n", -1);
++        for (i = 0; lines[i] != NULL; i++) {
++                char *p, *name, *name_end, *value, *value_end;
++
++                p = lines[i];
++
++                while (g_ascii_isspace (*p))
++                        p++;
++
++                if (*p == '#' || *p == '\0')
++                        continue;
++                name = p;
++                while (is_valid_char (*p, p == name))
++                        p++;
++                name_end = p;
++                while (g_ascii_isspace (*p))
++                        p++;
++                if (name == name_end || *p != '=') {
++                        continue;
++                }
++                *name_end = '\0';
++
++                p++;
++
++                while (g_ascii_isspace (*p))
++                        p++;
++
++                value = p;
++                value_end = value + strlen (value) - 1;
++
++                if (value != value_end && *value == '"' && *value_end == '"') {
++                        value++;
++                        *value_end = '\0';
++                }
++
++                if (strcmp (name, "ID") == 0) {
++                        g_debug ("ActUserManager: system OS is '%s'", value);
++                        priv->os_id = g_strdup (value);
++                } else if (strcmp (name, "VERSION_ID") == 0) {
++                        g_debug ("ActUserManager: system OS version is '%s'", value);
++                        priv->os_version_id = g_strdup (value);
++                }
++        }
++}
++
+ static void
+ act_user_manager_init (ActUserManager *manager)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         g_autoptr(GError) error = NULL;
+ 
+         act_user_manager_error_quark (); /* register dbus errors */
+ 
+         /* sessions */
+         priv->sessions = g_hash_table_new_full (g_str_hash,
+                                                 g_str_equal,
+                                                 g_free,
+                                                 g_object_unref);
+ 
+         /* users */
+         priv->normal_users_by_name = g_hash_table_new_full (g_str_hash,
+                                                             g_str_equal,
+                                                             g_free,
+                                                             g_object_unref);
+         priv->system_users_by_name = g_hash_table_new_full (g_str_hash,
+                                                             g_str_equal,
+                                                             g_free,
+                                                             g_object_unref);
+         priv->users_by_object_path = g_hash_table_new_full (g_str_hash,
+                                                             g_str_equal,
+                                                             NULL,
+                                                             g_object_unref);
+ 
+         priv->connection = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, &error);
+         if (priv->connection == NULL) {
+                 if (error != NULL) {
+                         g_warning ("Failed to connect to the D-Bus daemon: %s", error->message);
+                 } else {
+                         g_warning ("Failed to connect to the D-Bus daemon");
+                 }
+                 return;
+         }
+ 
+         ensure_accounts_proxy (manager);
+ 
++        load_os_release (manager);
++
+         priv->seat.state = ACT_USER_MANAGER_SEAT_STATE_UNLOADED;
+ }
+ 
+ static void
+ act_user_manager_finalize (GObject *object)
+ {
+         ActUserManager *manager = ACT_USER_MANAGER (object);
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         GSList         *node;
+ 
+         g_debug ("ActUserManager: finalizing user manager");
+ 
+         g_slist_foreach (priv->new_sessions,
+                          (GFunc) unload_new_session, NULL);
+         g_slist_free (priv->new_sessions);
+ 
+         g_slist_foreach (priv->fetch_user_requests,
+                          (GFunc) free_fetch_user_request, NULL);
+         g_slist_free (priv->fetch_user_requests);
+ 
+         g_slist_free (priv->new_users_inhibiting_load);
+ 
+         node = priv->new_users;
+         while (node != NULL) {
+                 ActUser *user;
+                 GSList  *next_node;
+ 
+                 user = ACT_USER (node->data);
+                 next_node = node->next;
+ 
+@@ -3071,143 +3148,181 @@ act_user_manager_finalize (GObject *object)
+ 
+ #ifdef WITH_SYSTEMD
+         if (priv->seat.session_monitor != NULL) {
+                 sd_login_monitor_unref (priv->seat.session_monitor);
+         }
+ 
+         if (priv->seat.session_monitor_stream != NULL) {
+                 g_object_unref (priv->seat.session_monitor_stream);
+         }
+ 
+         if (priv->seat.session_monitor_source_id != 0) {
+                 g_source_remove (priv->seat.session_monitor_source_id);
+         }
+ #endif
+ 
+         if (priv->accounts_proxy != NULL) {
+                 g_object_unref (priv->accounts_proxy);
+         }
+ 
+         if (priv->load_id > 0) {
+                 g_source_remove (priv->load_id);
+                 priv->load_id = 0;
+         }
+ 
+         g_hash_table_destroy (priv->sessions);
+ 
+         g_hash_table_destroy (priv->normal_users_by_name);
+         g_hash_table_destroy (priv->system_users_by_name);
+         g_hash_table_destroy (priv->users_by_object_path);
+ 
++        g_free (priv->os_id);
++        g_free (priv->os_version_id);
++
+         G_OBJECT_CLASS (act_user_manager_parent_class)->finalize (object);
+ }
+ 
+ /**
+  * act_user_manager_get_default:
+  *
+  * Returns the user manager singleton instance.  Calling this function will
+  * automatically being loading the user list if it isn't loaded already.
+  * The #ActUserManager:is-loaded property will be set to %TRUE when the users
+  * are finished loading and then act_user_manager_list_users() can be called.
+  *
+  * Returns: (transfer none): user manager object
+  */
+ ActUserManager *
+ act_user_manager_get_default (void)
+ {
+         if (user_manager_object == NULL) {
+                 user_manager_object = g_object_new (ACT_TYPE_USER_MANAGER, NULL);
+                 g_object_add_weak_pointer (user_manager_object,
+                                            (gpointer *) &user_manager_object);
+                 act_user_manager_queue_load (user_manager_object);
+         }
+ 
+         return ACT_USER_MANAGER (user_manager_object);
+ }
+ 
+ /**
+  * act_user_manager_no_service:
+  * @manager: a #ActUserManager
+  *
+  * Check whether or not the accounts service is running.
+  *
+  * Returns: whether or not accounts service is running
+  */
+ gboolean
+ act_user_manager_no_service (ActUserManager *manager)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         return priv->accounts_proxy == NULL;
+ }
+ 
++static void
++save_system_info (ActUserManager *manager,
++                  const char     *user_path)
++{
++        ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
++        ActUserSystem *user_system_proxy = NULL;
++        g_autoptr(GError) error = NULL;
++
++        if (priv->os_id == NULL && priv->os_version_id == NULL)
++                return;
++
++        user_system_proxy = act_user_system_proxy_new_sync (priv->connection,
++                                                            G_DBUS_PROXY_FLAGS_NONE,
++                                                            ACCOUNTS_NAME,
++                                                            user_path,
++                                                            NULL,
++                                                            &error);
++        if (user_system_proxy != NULL) {
++                if (priv->os_id != NULL)
++                        act_user_system_set_id (user_system_proxy, priv->os_id);
++
++                if (priv->os_version_id != NULL)
++                        act_user_system_set_version_id (user_system_proxy, priv->os_version_id);
++        } else {
++                /* probably means accountsservice and lib are out of sync */
++                g_debug ("ActUserManager: failed to create user system proxy: %s",
++                         error? error->message: "");
++                g_clear_error (&error);
++        }
++
++        g_clear_object (&user_system_proxy);
++}
++
+ /**
+  * act_user_manager_create_user:
+  * @manager: a #ActUserManager
+  * @username: a unix user name
+  * @fullname: a unix GECOS value
+  * @accounttype: a #ActUserAccountType
+  * @error: a #GError
+  *
+  * Creates a user account on the system.
+  *
+  * Returns: (transfer full): user object
+  */
+ ActUser *
+ act_user_manager_create_user (ActUserManager      *manager,
+                               const char          *username,
+                               const char          *fullname,
+                               ActUserAccountType   accounttype,
+                               GError             **error)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         GError *local_error = NULL;
+         gboolean res;
+         g_autofree gchar *path = NULL;
+         ActUser *user;
+ 
+         g_debug ("ActUserManager: Creating user '%s', '%s', %d",
+                  username, fullname, accounttype);
+ 
+         g_assert (priv->accounts_proxy != NULL);
+ 
+         res = accounts_accounts_call_create_user_sync (priv->accounts_proxy,
+                                                        username,
+                                                        fullname,
+                                                        accounttype,
+                                                        &path,
+                                                        NULL,
+                                                        &local_error);
+         if (!res) {
+                 g_propagate_error (error, local_error);
+                 return NULL;
+         }
+ 
++        save_system_info (manager, path);
++
+         user = add_new_user_for_object_path (path, manager);
+ 
+         return user;
+ }
+ 
+ static void
+ act_user_manager_async_complete_handler (GObject      *source,
+                                          GAsyncResult *result,
+                                          gpointer      user_data)
+ {
+         GTask *task = user_data;
+ 
+         g_task_return_pointer (task, g_object_ref (result), g_object_unref);
+         g_object_unref (task);
+ }
+ 
+ /**
+  * act_user_manager_create_user_async:
+  * @manager: a #ActUserManager
+  * @username: a unix user name
+  * @fullname: a unix GECOS value
+  * @accounttype: a #ActUserAccountType
+  * @cancellable: (allow-none): optional #GCancellable object,
+  *     %NULL to ignore
+  * @callback: (scope async): a #GAsyncReadyCallback to call
+  *     when the request is satisfied
+  * @user_data: (closure): the data to pass to @callback
+  *
+  * Asynchronously creates a user account on the system.
+  *
+@@ -3253,106 +3368,111 @@ act_user_manager_create_user_async (ActUserManager      *manager,
+  * @manager: a #ActUserManager
+  * @result: a #GAsyncResult
+  * @error: a #GError
+  *
+  * Finishes an asynchronous user creation.
+  *
+  * See act_user_manager_create_user_async().
+  *
+  * Returns: (transfer full): user object
+  *
+  * Since: 0.6.27
+  */
+ ActUser *
+ act_user_manager_create_user_finish (ActUserManager  *manager,
+                                      GAsyncResult    *result,
+                                      GError         **error)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         GAsyncResult *inner_result;
+         ActUser *user = NULL;
+         g_autofree gchar *path = NULL;
+         GError *remote_error = NULL;
+ 
+         inner_result = g_task_propagate_pointer (G_TASK (result), error);
+         if (inner_result == NULL) {
+                 return FALSE;
+         }
+ 
+         if (accounts_accounts_call_create_user_finish (priv->accounts_proxy,
+                                                        &path, inner_result, &remote_error)) {
++
++                save_system_info (manager, path);
++
+                 user = add_new_user_for_object_path (path, manager);
+         }
+ 
+         if (remote_error) {
+                 g_dbus_error_strip_remote_error (remote_error);
+                 g_propagate_error (error, remote_error);
+         }
+ 
+         return user;
+ }
+ 
+ /**
+  * act_user_manager_cache_user:
+  * @manager: a #ActUserManager
+  * @username: a user name
+  * @error: a #GError
+  *
+  * Caches a user account so it shows up via act_user_manager_list_users().
+  *
+  * Returns: (transfer full): user object
+  */
+ ActUser *
+ act_user_manager_cache_user (ActUserManager     *manager,
+                              const char         *username,
+                              GError            **error)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         GError *local_error = NULL;
+         gboolean res;
+         g_autofree gchar *path = NULL;
+ 
+         g_debug ("ActUserManager: Caching user '%s'",
+                  username);
+ 
+         g_assert (priv->accounts_proxy != NULL);
+ 
+         res = accounts_accounts_call_cache_user_sync (priv->accounts_proxy,
+                                                       username,
+                                                       &path,
+                                                       NULL,
+                                                       &local_error);
+         if (!res) {
+                 g_propagate_error (error, local_error);
+                 return NULL;
+         }
+ 
++        save_system_info (manager, path);
++
+         return add_new_user_for_object_path (path, manager);
+ }
+ 
+ 
+ /**
+  * act_user_manager_cache_user_async:
+  * @manager: a #ActUserManager
+  * @username: a unix user name
+  * @cancellable: (allow-none): optional #GCancellable object,
+  *     %NULL to ignore
+  * @callback: (scope async): a #GAsyncReadyCallback to call
+  *     when the request is satisfied
+  * @user_data: (closure): the data to pass to @callback
+  *
+  * Asynchronously caches a user account so it shows up via
+  * act_user_manager_list_users().
+  *
+  * For more details, see act_user_manager_cache_user(), which
+  * is the synchronous version of this call.
+  *
+  * Since: 0.6.27
+  */
+ void
+ act_user_manager_cache_user_async (ActUserManager      *manager,
+                                    const char          *username,
+                                    GCancellable        *cancellable,
+                                    GAsyncReadyCallback  callback,
+                                    gpointer             user_data)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+@@ -3378,60 +3498,63 @@ act_user_manager_cache_user_async (ActUserManager      *manager,
+  * @manager: a #ActUserManager
+  * @result: a #GAsyncResult
+  * @error: a #GError
+  *
+  * Finishes an asynchronous user caching.
+  *
+  * See act_user_manager_cache_user_async().
+  *
+  * Returns: (transfer full): user object
+  *
+  * Since: 0.6.27
+  */
+ ActUser *
+ act_user_manager_cache_user_finish (ActUserManager  *manager,
+                                     GAsyncResult    *result,
+                                     GError         **error)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+         GAsyncResult *inner_result;
+         ActUser *user = NULL;
+         g_autofree gchar *path = NULL;
+         GError *remote_error = NULL;
+ 
+         inner_result = g_task_propagate_pointer (G_TASK (result), error);
+         if (inner_result == NULL) {
+                 return FALSE;
+         }
+ 
+         if (accounts_accounts_call_cache_user_finish (priv->accounts_proxy,
+                                                       &path, inner_result, &remote_error)) {
++
++                save_system_info (manager, path);
++
+                 user = add_new_user_for_object_path (path, manager);
+         }
+ 
+         if (remote_error) {
+                 g_dbus_error_strip_remote_error (remote_error);
+                 g_propagate_error (error, remote_error);
+         }
+ 
+         return user;
+ }
+ 
+ /**
+  * act_user_manager_uncache_user:
+  * @manager: a #ActUserManager
+  * @username: a user name
+  * @error: a #GError
+  *
+  * Releases all metadata about a user account, including icon,
+  * language and session. If the user account is from a remote
+  * server and the user has never logged in before, then that
+  * account will no longer show up in ListCachedUsers() output.
+  *
+  * Returns: %TRUE if successful, otherwise %FALSE
+  */
+ gboolean
+ act_user_manager_uncache_user (ActUserManager     *manager,
+                                const char         *username,
+                                GError            **error)
+ {
+         ActUserManagerPrivate *priv = act_user_manager_get_instance_private (manager);
+diff --git a/src/libaccountsservice/meson.build b/src/libaccountsservice/meson.build
+index 4e134db..9e85bba 100644
+--- a/src/libaccountsservice/meson.build
++++ b/src/libaccountsservice/meson.build
+@@ -21,60 +21,67 @@ enum_types = 'act-user-enum-types'
+ 
+ enum_sources = gnome.mkenums(
+   enum_types,
+   sources: headers,
+   c_template: enum_types + '.c.template',
+   h_template: enum_types + '.h.template',
+   install_header: true,
+   install_dir: join_paths(act_pkgincludedir, subdir),
+ )
+ 
+ dbus_sources = []
+ 
+ ifaces = [
+   'Manager',
+   'Seat',
+   'Session',
+ ]
+ 
+ namespace = 'ConsoleKit'
+ prefix = 'org.freedesktop.' + namespace
+ 
+ foreach iface: ifaces
+   dbus_sources += gnome.gdbus_codegen(
+     'ck-@0@-generated'.format(iface.to_lower()),
+     '@0@.@1@.xml'.format(prefix, iface),
+     interface_prefix: prefix,
+     namespace: namespace,
+   )
+ endforeach
+ 
++dbus_sources += gnome.gdbus_codegen(
++   'com.redhat.AccountsServiceUser.System',
++   join_paths(data_dir, 'com.redhat.AccountsServiceUser.System.xml'),
++   interface_prefix: 'com.redhat.AccountsService',
++   namespace: 'Act',
++)
++
+ deps = [
+   crypt_dep,
+   gio_unix_dep,
+   glib_dep,
+   libaccounts_generated_dep,
+ ]
+ 
+ symbol_map = join_paths(meson.current_source_dir(), 'symbol.map')
+ ldflags = cc.get_supported_link_arguments('-Wl,--version-script,@0@'.format(symbol_map))
+ 
+ if enable_systemd or enable_elogind
+   deps += logind_dep
+ endif
+ 
+ libaccountsservice = shared_library(
+   act_name,
+   sources: sources + enum_sources + dbus_sources,
+   version: libversion,
+   include_directories: top_inc,
+   dependencies: deps,
+   c_args: '-DG_LOG_DOMAIN="@0@"'.format(meson.project_name()),
+   link_args: ldflags,
+   link_depends: symbol_map,
+   install: true,
+ )
+ 
+ libaccountsservice_dep = declare_dependency(
+   sources: enum_sources[1],
+   include_directories: include_directories('.'),
+   dependencies: [gio_dep, glib_dep],
+-- 
+2.27.0
+
