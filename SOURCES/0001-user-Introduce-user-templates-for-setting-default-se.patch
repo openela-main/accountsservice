@@ -1,0 +1,925 @@
+From 72427bd4fcae931298c670093f9cbd34ad58f59a Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Wed, 4 Aug 2021 19:54:59 -0400
+Subject: [PATCH] user: Introduce user templates for setting default session
+ etc
+
+At the moment there's no easy way to set a default session, or
+face icon or whatever for all users.  If a user has never logged in
+before, we just generate their cache file from hardcoded defaults.
+
+This commit introduces a template system to make it possible for
+admins to set up defaults on their own.
+
+Admins can write either
+/etc/accountsservice/user-templates/administrator
+or
+/etc/accountsservice/user-templates/standard
+
+files.  These files follow the same format as
+
+/var/lib/AccountsService/users/username
+
+files, but will support substituting $HOME and $USER to the appropriate
+user specific values.
+
+User templates also support an additional group [Template] that
+have an additional key EnvironmentFiles that specify a list
+of environment files to load (files with KEY=VALUE pairs in them).
+Any keys listed in those environment files will also get substituted.
+---
+ data/administrator |   6 +
+ data/meson.build   |  10 ++
+ data/standard      |   6 +
+ src/daemon.c       |   8 +-
+ src/meson.build    |   1 +
+ src/user.c         | 284 ++++++++++++++++++++++++++++++++++++++++++++-
+ src/user.h         |   3 +-
+ 7 files changed, 305 insertions(+), 13 deletions(-)
+ create mode 100644 data/administrator
+ create mode 100644 data/standard
+
+diff --git a/data/administrator b/data/administrator
+new file mode 100644
+index 0000000..ea043c9
+--- /dev/null
++++ b/data/administrator
+@@ -0,0 +1,6 @@
++[Template]
++#EnvironmentFiles=/etc/os-release;
++
++[User]
++Session=
++Icon=${HOME}/.face
+diff --git a/data/meson.build b/data/meson.build
+index 2dc57c2..7d9bdcd 100644
+--- a/data/meson.build
++++ b/data/meson.build
+@@ -22,30 +22,40 @@ service = act_namespace + '.service'
+ configure_file(
+   input: service + '.in',
+   output: service,
+   configuration: service_conf,
+   install: true,
+   install_dir: dbus_sys_dir,
+ )
+ 
+ policy = act_namespace.to_lower() + '.policy'
+ 
+ i18n.merge_file(
+   policy,
+   input: policy + '.in',
+   output: policy,
+   po_dir: po_dir,
+   install: true,
+   install_dir: policy_dir,
+ )
+ 
+ if install_systemd_unit_dir
+   service = 'accounts-daemon.service'
+ 
+   configure_file(
+     input: service + '.in',
+     output: service,
+     configuration: service_conf,
+     install: true,
+     install_dir: systemd_system_unit_dir,
+   )
+ endif
++
++install_data(
++  'administrator',
++  install_dir: join_paths(act_datadir, 'accountsservice', 'user-templates'),
++)
++
++install_data(
++  'standard',
++  install_dir: join_paths(act_datadir, 'accountsservice', 'user-templates'),
++)
+diff --git a/data/standard b/data/standard
+new file mode 100644
+index 0000000..ea043c9
+--- /dev/null
++++ b/data/standard
+@@ -0,0 +1,6 @@
++[Template]
++#EnvironmentFiles=/etc/os-release;
++
++[User]
++Session=
++Icon=${HOME}/.face
+diff --git a/src/daemon.c b/src/daemon.c
+index 5ce0216..66ac7ba 100644
+--- a/src/daemon.c
++++ b/src/daemon.c
+@@ -298,69 +298,63 @@ entry_generator_cachedir (Daemon       *daemon,
+                         break;
+ 
+                 /* Only load files in this directory */
+                 filename = g_build_filename (USERDIR, name, NULL);
+                 regular = g_file_test (filename, G_FILE_TEST_IS_REGULAR);
+ 
+                 if (regular) {
+                         errno = 0;
+                         pwent = getpwnam (name);
+                         if (pwent != NULL) {
+                                 *shadow_entry = getspnam (pwent->pw_name);
+ 
+                                 return pwent;
+                         } else if (errno == 0) {
+                                 g_debug ("user '%s' in cache dir but not present on system, removing", name);
+                                 remove_cache_files (name);
+                         }
+                         else {
+                                 g_warning ("failed to check if user '%s' in cache dir is present on system: %s",
+                                   name, g_strerror (errno));
+                         }
+                 }
+         }
+ 
+         /* Last iteration */
+         g_dir_close (dir);
+ 
+         /* Update all the users from the files in the cache dir */
+         g_hash_table_iter_init (&iter, users);
+         while (g_hash_table_iter_next (&iter, &key, &value)) {
+-                const gchar *name = key;
+                 User *user = value;
+-                g_autofree gchar *filename = NULL;
+-                g_autoptr(GKeyFile) key_file = NULL;
+ 
+-                filename = g_build_filename (USERDIR, name, NULL);
+-                key_file = g_key_file_new ();
+-                if (g_key_file_load_from_file (key_file, filename, 0, NULL))
+-                        user_update_from_keyfile (user, key_file);
++                user_update_from_cache (user);
+         }
+ 
+         *state = NULL;
+         return NULL;
+ }
+ 
+ static struct passwd *
+ entry_generator_requested_users (Daemon       *daemon,
+                                  GHashTable   *users,
+                                  gpointer     *state,
+                                  struct spwd **shadow_entry)
+ {
+         DaemonPrivate *priv = daemon_get_instance_private (daemon);
+         struct passwd *pwent;
+         GList *node;
+ 
+         /* First iteration */
+         if (*state == NULL) {
+                 *state = priv->explicitly_requested_users;
+         }
+ 
+         /* Every iteration */
+ 
+         if (g_hash_table_size (users) < MAX_LOCAL_USERS) {
+                 node = *state;
+                 while (node != NULL) {
+                         const char *name;
+ 
+                         name = node->data;
+                         node = node->next;
+diff --git a/src/meson.build b/src/meson.build
+index 3970749..d3b0cb9 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -1,59 +1,60 @@
+ sources = []
+ 
+ gdbus_headers = []
+ 
+ ifaces = [
+   ['accounts-generated', 'org.freedesktop.', 'Accounts'],
+   ['accounts-user-generated', act_namespace + '.', 'User'],
+   ['realmd-generated', 'org.freedesktop.', 'realmd'],
+ ]
+ 
+ foreach iface: ifaces
+   gdbus_sources = gnome.gdbus_codegen(
+     iface[0],
+     join_paths(data_dir, iface[1] + iface[2] + '.xml'),
+     interface_prefix: iface[1],
+     namespace: 'Accounts',
+   )
+   sources += gdbus_sources
+   gdbus_headers += gdbus_sources[1]
+ endforeach
+ 
+ deps = [
+   gio_dep,
+   gio_unix_dep,
+ ]
+ 
+ cflags = [
+   '-DLOCALSTATEDIR="@0@"'.format(act_localstatedir),
+   '-DDATADIR="@0@"'.format(act_datadir),
++  '-DSYSCONFDIR="@0@"'.format(act_sysconfdir),
+   '-DICONDIR="@0@"'.format(join_paths(act_localstatedir, 'lib', 'AccountsService', 'icons')),
+   '-DUSERDIR="@0@"'.format(join_paths(act_localstatedir, 'lib', 'AccountsService', 'users')),
+ ]
+ 
+ libaccounts_generated = static_library(
+   'accounts-generated',
+   sources: sources,
+   include_directories: top_inc,
+   dependencies: deps,
+   c_args: cflags,
+ )
+ 
+ libaccounts_generated_dep = declare_dependency(
+   sources: gdbus_headers,
+   include_directories: include_directories('.'),
+   dependencies: gio_dep,
+   link_with: libaccounts_generated,
+ )
+ 
+ sources = files(
+   'daemon.c',
+   'extensions.c',
+   'main.c',
+   'user.c',
+   'user-classify.c',
+   'util.c',
+   'wtmp-helper.c',
+ )
+ 
+ deps = [
+diff --git a/src/user.c b/src/user.c
+index 9f57af5..16c7721 100644
+--- a/src/user.c
++++ b/src/user.c
+@@ -43,127 +43,384 @@
+ #include <polkit/polkit.h>
+ 
+ #include "user-classify.h"
+ #include "daemon.h"
+ #include "user.h"
+ #include "accounts-user-generated.h"
+ #include "util.h"
+ 
+ struct User {
+         AccountsUserSkeleton parent;
+ 
+         GDBusConnection *system_bus_connection;
+         gchar *object_path;
+ 
+         Daemon       *daemon;
+ 
+         GKeyFile     *keyfile;
+ 
+         gid_t         gid;
+         gint64        expiration_time;
+         gint64        last_change_time;
+         gint64        min_days_between_changes;
+         gint64        max_days_between_changes;
+         gint64        days_to_warn;
+         gint64        days_after_expiration_until_lock;
+         GVariant     *login_history;
+         gchar        *icon_file;
+         gchar        *default_icon_file;
+         gboolean      account_expiration_policy_known;
+         gboolean      cached;
++        gboolean      template_loaded;
+ 
+         guint        *extension_ids;
+         guint         n_extension_ids;
+ 
+         guint         changed_timeout_id;
+ };
+ 
+ typedef struct UserClass
+ {
+         AccountsUserSkeletonClass parent_class;
+ } UserClass;
+ 
+ static void user_accounts_user_iface_init (AccountsUserIface *iface);
++static void user_update_from_keyfile (User *user, GKeyFile *keyfile);
+ 
+ G_DEFINE_TYPE_WITH_CODE (User, user, ACCOUNTS_TYPE_USER_SKELETON, G_IMPLEMENT_INTERFACE (ACCOUNTS_TYPE_USER, user_accounts_user_iface_init));
+ 
+ static gint
+ account_type_from_pwent (struct passwd *pwent)
+ {
+         struct group *grp;
+         gint i;
+ 
+         if (pwent->pw_uid == 0) {
+                 g_debug ("user is root so account type is administrator");
+                 return ACCOUNT_TYPE_ADMINISTRATOR;
+         }
+ 
+         grp = getgrnam (ADMIN_GROUP);
+         if (grp == NULL) {
+                 g_debug (ADMIN_GROUP " group not found");
+                 return ACCOUNT_TYPE_STANDARD;
+         }
+ 
+         for (i = 0; grp->gr_mem[i] != NULL; i++) {
+                 if (g_strcmp0 (grp->gr_mem[i], pwent->pw_name) == 0) {
+                         return ACCOUNT_TYPE_ADMINISTRATOR;
+                 }
+         }
+ 
+         return ACCOUNT_TYPE_STANDARD;
+ }
+ 
+ static void
+ user_reset_icon_file (User *user)
+ {
+         const char *icon_file;
+         gboolean    icon_is_default;
+         const char *home_dir;
+ 
+         icon_file = accounts_user_get_icon_file (ACCOUNTS_USER (user));
+ 
+         if (icon_file == NULL || g_strcmp0 (icon_file, user->default_icon_file) == 0) {
+                 icon_is_default = TRUE;
+         } else {
+                 icon_is_default = FALSE;
+         }
+ 
+         g_free (user->default_icon_file);
+         home_dir = accounts_user_get_home_directory (ACCOUNTS_USER (user));
+ 
+         user->default_icon_file = g_build_filename (home_dir, ".face", NULL);
+ 
+         if (icon_is_default) {
+                 accounts_user_set_icon_file (ACCOUNTS_USER (user), user->default_icon_file);
+         }
+ }
+ 
++static gboolean
++user_has_cache_file (User *user)
++{
++        g_autofree char *filename = NULL;
++
++        filename = g_build_filename (USERDIR, user_get_user_name (user), NULL);
++
++        return g_file_test (filename, G_FILE_TEST_EXISTS);
++}
++
++static gboolean
++is_valid_shell_identifier_character (char     c,
++                                     gboolean first)
++{
++        return (!first && g_ascii_isdigit (c)) ||
++                c == '_' ||
++                g_ascii_isalpha (c);
++}
++
++static char *
++expand_template_variables (User       *user,
++                           GHashTable *template_variables,
++                           const char *str)
++{
++        GString *s = g_string_new ("");
++        const char *p, *start;
++        char c;
++
++        p = str;
++        while (*p) {
++                c = *p;
++                if (c == '\\') {
++                        p++;
++                        c = *p;
++                        if (c != '\0') {
++                                p++;
++                                switch (c) {
++                                case '\\':
++                                        g_string_append_c (s, '\\');
++                                        break;
++                                case '$':
++                                        g_string_append_c (s, '$');
++                                        break;
++                                default:
++                                        g_string_append_c (s, '\\');
++                                        g_string_append_c (s, c);
++                                        break;
++                                }
++                        }
++                } else if (c == '$') {
++                        gboolean brackets = FALSE;
++                        p++;
++                        if (*p == '{') {
++                                brackets = TRUE;
++                                p++;
++                        }
++                        start = p;
++                        while (*p != '\0' &&
++                               is_valid_shell_identifier_character (*p, p == start))
++                                p++;
++                        if (p == start || (brackets && *p != '}')) {
++                                g_string_append_c (s, '$');
++                                if (brackets)
++                                        g_string_append_c (s, '{');
++                                g_string_append_len (s, start, p - start);
++                        } else {
++                                g_autofree char *variable = NULL;
++                                const char *value;
++
++                                if (brackets && *p == '}')
++                                        p++;
++
++                                variable = g_strndup (start, p - start - 1);
++
++                                value = g_hash_table_lookup (template_variables, variable);
++                                if (value) {
++                                        g_string_append (s, value);
++                                }
++                        }
++                } else {
++                        p++;
++                        g_string_append_c (s, c);
++                }
++        }
++        return g_string_free (s, FALSE);
++}
++
++static void
++load_template_environment_file (User       *user,
++                                GHashTable *variables,
++                                const char *file)
++{
++        g_autofree char *contents = NULL;
++        g_auto (GStrv) lines = NULL;
++        g_autoptr (GError) error = NULL;
++        gboolean file_loaded;
++        size_t i;
++
++        file_loaded = g_file_get_contents (file, &contents, NULL, &error);
++
++        if (!file_loaded) {
++                g_debug ("Couldn't load template environment file %s: %s",
++                         file, error->message);
++                return;
++        }
++
++        lines = g_strsplit (contents, "\n", -1);
++
++        for (i = 0; lines[i] != NULL; i++) {
++                char *p;
++                char *variable_end;
++                const char *variable;
++                const char *value;
++
++                p = lines[i];
++                while (g_ascii_isspace (*p))
++                        p++;
++                if (*p == '#' || *p == '\0')
++                        continue;
++                variable = p;
++                while (is_valid_shell_identifier_character (*p, p == variable))
++                        p++;
++                variable_end = p;
++                while (g_ascii_isspace (*p))
++                        p++;
++                if (variable_end == variable || *p != '=') {
++                        g_debug ("template environment file %s has invalid line '%s'\n", file, lines[i]);
++                        continue;
++                }
++                *variable_end = '\0';
++                p++;
++                while (g_ascii_isspace (*p))
++                        p++;
++                value = p;
++
++                if (g_hash_table_lookup (variables, variable) == NULL) {
++                        g_hash_table_insert (variables,
++                                             g_strdup (variable),
++                                             g_strdup (value));
++                }
++
++        }
++}
++
++static void
++initialize_template_environment (User               *user,
++                                 GHashTable         *variables,
++                                 const char * const *files)
++{
++        size_t i;
++
++        g_hash_table_insert (variables, g_strdup ("HOME"), g_strdup (accounts_user_get_home_directory (ACCOUNTS_USER (user))));
++        g_hash_table_insert (variables, g_strdup ("USER"), g_strdup (user_get_user_name (user)));
++
++        if (files == NULL)
++                return;
++
++        for (i = 0; files[i] != NULL; i++) {
++                load_template_environment_file (user, variables, files[i]);
++        }
++}
++
++static void
++user_update_from_template (User *user)
++{
++        g_autofree char *filename = NULL;
++        g_autoptr (GKeyFile) key_file = NULL;
++        g_autoptr (GError) error = NULL;
++        g_autoptr (GHashTable) template_variables = NULL;
++        g_auto (GStrv) template_environment_files = NULL;
++        gboolean key_file_loaded = FALSE;
++        const char * const *system_dirs[] = {
++                (const char *[]) { "/run", SYSCONFDIR, NULL },
++                g_get_system_data_dirs (),
++                NULL
++        };
++        g_autoptr (GPtrArray) dirs = NULL;
++        AccountType account_type;
++        const char *account_type_string;
++        size_t i, j;
++        g_autofree char *contents = NULL;
++        g_autofree char *expanded = NULL;
++        g_auto (GStrv) lines = NULL;
++
++        if (user->template_loaded)
++                return;
++
++        filename = g_build_filename (USERDIR,
++                                     accounts_user_get_user_name (ACCOUNTS_USER (user)),
++                                     NULL);
++
++        account_type = accounts_user_get_account_type (ACCOUNTS_USER (user));
++        if (account_type == ACCOUNT_TYPE_ADMINISTRATOR)
++                account_type_string = "administrator";
++        else
++                account_type_string = "standard";
++
++        dirs = g_ptr_array_new ();
++        for (i = 0; system_dirs[i] != NULL; i++) {
++                for (j = 0; system_dirs[i][j] != NULL; j++) {
++                        char *dir;
++
++                        dir = g_build_filename (system_dirs[i][j],
++                                                "accountsservice",
++                                                "user-templates",
++                                                NULL);
++                        g_ptr_array_add (dirs, dir);
++                }
++        }
++        g_ptr_array_add (dirs, NULL);
++
++        key_file = g_key_file_new ();
++        key_file_loaded = g_key_file_load_from_dirs (key_file,
++                                                     account_type_string,
++                                                     (const char **) dirs->pdata,
++                                                     NULL,
++                                                     G_KEY_FILE_KEEP_COMMENTS,
++                                                     &error);
++
++        if (!key_file_loaded) {
++                g_debug ("failed to load user template: %s", error->message);
++                return;
++        }
++
++        template_variables = g_hash_table_new_full (g_str_hash,
++                                                    g_str_equal,
++                                                    g_free,
++                                                    g_free);
++
++        template_environment_files = g_key_file_get_string_list (key_file,
++                                                                 "Template",
++                                                                 "EnvironmentFiles",
++                                                                 NULL,
++                                                                 NULL);
++
++        initialize_template_environment (user, template_variables, (const char * const *) template_environment_files);
++
++        g_key_file_remove_group (key_file, "Template", NULL);
++        contents = g_key_file_to_data (key_file, NULL, NULL);
++        lines = g_strsplit (contents, "\n", -1);
++
++        expanded = expand_template_variables (user, template_variables, contents);
++
++        key_file_loaded = g_key_file_load_from_data (key_file,
++                                                     expanded,
++                                                     strlen (expanded),
++                                                     G_KEY_FILE_KEEP_COMMENTS,
++                                                     &error);
++
++        if (key_file_loaded)
++                user_update_from_keyfile (user, key_file);
++
++        user->template_loaded = key_file_loaded;
++}
++
+ void
+ user_update_from_pwent (User          *user,
+                         struct passwd *pwent,
+                         struct spwd   *spent)
+ {
+         g_autofree gchar *real_name = NULL;
+         gboolean is_system_account;
+         const gchar *passwd;
+         gboolean locked;
+         PasswordMode mode;
+         AccountType account_type;
+ 
+         g_object_freeze_notify (G_OBJECT (user));
+ 
+         if (pwent->pw_gecos && pwent->pw_gecos[0] != '\0') {
+                 gchar *first_comma = NULL;
+                 gchar *valid_utf8_name = NULL;
+ 
+                 if (g_utf8_validate (pwent->pw_gecos, -1, NULL)) {
+                         valid_utf8_name = pwent->pw_gecos;
+                         first_comma = g_utf8_strchr (valid_utf8_name, -1, ',');
+                 }
+                 else {
+                         g_warning ("User %s has invalid UTF-8 in GECOS field. "
+                                    "It would be a good thing to check /etc/passwd.",
+                                    pwent->pw_name ? pwent->pw_name : "");
+                 }
+ 
+                 if (first_comma) {
+                         real_name = g_strndup (valid_utf8_name,
+@@ -212,134 +469,150 @@ user_update_from_pwent (User          *user,
+         accounts_user_set_locked (ACCOUNTS_USER (user), locked);
+ 
+         if (passwd == NULL || passwd[0] != 0) {
+                 mode = PASSWORD_MODE_REGULAR;
+         }
+         else {
+                 mode = PASSWORD_MODE_NONE;
+         }
+ 
+         if (spent) {
+                 if (spent->sp_lstchg == 0) {
+                         mode = PASSWORD_MODE_SET_AT_LOGIN;
+                 }
+ 
+                 user->expiration_time = spent->sp_expire;
+                 user->last_change_time  = spent->sp_lstchg;
+                 user->min_days_between_changes = spent->sp_min;
+                 user->max_days_between_changes = spent->sp_max;
+                 user->days_to_warn  = spent->sp_warn;
+                 user->days_after_expiration_until_lock = spent->sp_inact;
+                 user->account_expiration_policy_known = TRUE;
+         }
+ 
+         accounts_user_set_password_mode (ACCOUNTS_USER (user), mode);
+         is_system_account = !user_classify_is_human (accounts_user_get_uid (ACCOUNTS_USER (user)),
+                                                      accounts_user_get_user_name (ACCOUNTS_USER (user)),
+                                                      accounts_user_get_shell (ACCOUNTS_USER (user)),
+                                                      passwd);
+         accounts_user_set_system_account (ACCOUNTS_USER (user), is_system_account);
+ 
++        if (!user_has_cache_file (user))
++                user_update_from_template (user);
+         g_object_thaw_notify (G_OBJECT (user));
+ }
+ 
+-void
++static void
+ user_update_from_keyfile (User     *user,
+                           GKeyFile *keyfile)
+ {
+         gchar *s;
+ 
+-        g_object_freeze_notify (G_OBJECT (user));
+-
+         s = g_key_file_get_string (keyfile, "User", "Language", NULL);
+         if (s != NULL) {
+                 accounts_user_set_language (ACCOUNTS_USER (user), s);
+                 g_clear_pointer (&s, g_free);
+         }
+ 
+         s = g_key_file_get_string (keyfile, "User", "XSession", NULL);
+         if (s != NULL) {
+                 accounts_user_set_xsession (ACCOUNTS_USER (user), s);
+ 
+                 /* for backward compat */
+                 accounts_user_set_session (ACCOUNTS_USER (user), s);
+                 g_clear_pointer (&s, g_free);
+         }
+ 
+         s = g_key_file_get_string (keyfile, "User", "Session", NULL);
+         if (s != NULL) {
+                 accounts_user_set_session (ACCOUNTS_USER (user), s);
+                 g_clear_pointer (&s, g_free);
+         }
+ 
+         s = g_key_file_get_string (keyfile, "User", "SessionType", NULL);
+         if (s != NULL) {
+                 accounts_user_set_session_type (ACCOUNTS_USER (user), s);
+                 g_clear_pointer (&s, g_free);
+         }
+ 
+         s = g_key_file_get_string (keyfile, "User", "Email", NULL);
+         if (s != NULL) {
+                 accounts_user_set_email (ACCOUNTS_USER (user), s);
+                 g_clear_pointer (&s, g_free);
+         }
+ 
+         s = g_key_file_get_string (keyfile, "User", "Location", NULL);
+         if (s != NULL) {
+                 accounts_user_set_location (ACCOUNTS_USER (user), s);
+                 g_clear_pointer (&s, g_free);
+         }
+ 
+         s = g_key_file_get_string (keyfile, "User", "PasswordHint", NULL);
+         if (s != NULL) {
+                 accounts_user_set_password_hint (ACCOUNTS_USER (user), s);
+                 g_clear_pointer (&s, g_free);
+         }
+ 
+         s = g_key_file_get_string (keyfile, "User", "Icon", NULL);
+         if (s != NULL) {
+                 accounts_user_set_icon_file (ACCOUNTS_USER (user), s);
+                 g_clear_pointer (&s, g_free);
+         }
+ 
+         if (g_key_file_has_key (keyfile, "User", "SystemAccount", NULL)) {
+             gboolean system_account;
+ 
+             system_account = g_key_file_get_boolean (keyfile, "User", "SystemAccount", NULL);
+             accounts_user_set_system_account (ACCOUNTS_USER (user), system_account);
+         }
+ 
+         g_clear_pointer (&user->keyfile, g_key_file_unref);
+         user->keyfile = g_key_file_ref (keyfile);
++}
++
++void
++user_update_from_cache (User *user)
++{
++        g_autofree gchar *filename = NULL;
++        g_autoptr(GKeyFile) key_file = NULL;
++
++        filename = g_build_filename (USERDIR, accounts_user_get_user_name (ACCOUNTS_USER (user)), NULL);
++
++        key_file = g_key_file_new ();
++
++        if (!g_key_file_load_from_file (key_file, filename, 0, NULL))
++                return;
++
++        g_object_freeze_notify (G_OBJECT (user));
++        user_update_from_keyfile (user, key_file);
+         user_set_cached (user, TRUE);
+         user_set_saved (user, TRUE);
+-
+         g_object_thaw_notify (G_OBJECT (user));
+ }
+ 
+ void
+ user_update_local_account_property (User          *user,
+                                     gboolean       local)
+ {
+         accounts_user_set_local_account (ACCOUNTS_USER (user), local);
+ }
+ 
+ void
+ user_update_system_account_property (User          *user,
+                                      gboolean       system)
+ {
+         accounts_user_set_system_account (ACCOUNTS_USER (user), system);
+ }
+ 
+ static void
+ user_save_to_keyfile (User     *user,
+                       GKeyFile *keyfile)
+ {
+         g_key_file_remove_group (keyfile, "User", NULL);
+ 
+         if (accounts_user_get_email (ACCOUNTS_USER (user)))
+                 g_key_file_set_string (keyfile, "User", "Email", accounts_user_get_email (ACCOUNTS_USER (user)));
+ 
+         if (accounts_user_get_language (ACCOUNTS_USER (user)))
+                 g_key_file_set_string (keyfile, "User", "Language", accounts_user_get_language (ACCOUNTS_USER (user)));
+ 
+         if (accounts_user_get_session (ACCOUNTS_USER (user)))
+@@ -509,60 +782,63 @@ user_extension_set_property (User                  *user,
+         if (!prev || !g_str_equal (printed, prev)) {
+                 g_key_file_set_value (user->keyfile, interface->name, property->name, printed);
+ 
+                 /* Emit a change signal.  Use invalidation
+                  * because the data may not be world-readable.
+                  */
+                 g_dbus_connection_emit_signal (g_dbus_method_invocation_get_connection (invocation),
+                                                NULL, /* destination_bus_name */
+                                                g_dbus_method_invocation_get_object_path (invocation),
+                                                "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                                g_variant_new_parsed ("( %s, %a{sv}, [ %s ] )",
+                                                                      interface->name, NULL, property->name),
+                                                NULL);
+ 
+                 accounts_user_emit_changed (ACCOUNTS_USER (user));
+                 save_extra_data (user);
+         }
+ 
+         g_dbus_method_invocation_return_value (invocation, g_variant_new ("()"));
+ }
+ 
+ static void
+ user_extension_authentication_done (Daemon                *daemon,
+                                     User                  *user,
+                                     GDBusMethodInvocation *invocation,
+                                     gpointer               user_data)
+ {
+         GDBusInterfaceInfo *interface = user_data;
+         const gchar *method_name;
+ 
++        if (!user_has_cache_file (user))
++                user_update_from_template (user);
++
+         method_name = g_dbus_method_invocation_get_method_name (invocation);
+ 
+         if (g_str_equal (method_name, "Get"))
+                 user_extension_get_property (user, daemon, interface, invocation);
+         else if (g_str_equal (method_name, "GetAll"))
+                 user_extension_get_all_properties (user, daemon, interface, invocation);
+         else if (g_str_equal (method_name, "Set"))
+                 user_extension_set_property (user, daemon, interface, invocation);
+         else
+                 g_assert_not_reached ();
+ }
+ 
+ static void
+ user_extension_method_call (GDBusConnection       *connection,
+                             const gchar           *sender,
+                             const gchar           *object_path,
+                             const gchar           *interface_name,
+                             const gchar           *method_name,
+                             GVariant              *parameters,
+                             GDBusMethodInvocation *invocation,
+                             gpointer               user_data)
+ {
+         User *user = user_data;
+         GDBusInterfaceInfo *iface_info;
+         const gchar *annotation_name;
+         const gchar *action_id;
+         gint uid;
+         gint i;
+ 
+         /* We don't allow method calls on extension interfaces, so we
+diff --git a/src/user.h b/src/user.h
+index b3b3380..eb81918 100644
+--- a/src/user.h
++++ b/src/user.h
+@@ -30,58 +30,57 @@
+ #include "types.h"
+ 
+ G_BEGIN_DECLS
+ 
+ #define TYPE_USER (user_get_type ())
+ #define USER(object) (G_TYPE_CHECK_INSTANCE_CAST ((object), TYPE_USER, User))
+ #define IS_USER(object) (G_TYPE_CHECK_INSTANCE_TYPE ((object), TYPE_USER))
+ 
+ typedef enum {
+         ACCOUNT_TYPE_STANDARD,
+         ACCOUNT_TYPE_ADMINISTRATOR,
+ #define ACCOUNT_TYPE_LAST ACCOUNT_TYPE_ADMINISTRATOR
+ } AccountType;
+ 
+ typedef enum {
+         PASSWORD_MODE_REGULAR,
+         PASSWORD_MODE_SET_AT_LOGIN,
+         PASSWORD_MODE_NONE,
+ #define PASSWORD_MODE_LAST PASSWORD_MODE_NONE
+ } PasswordMode;
+ 
+ /* local methods */
+ 
+ GType          user_get_type                (void) G_GNUC_CONST;
+ User *         user_new                     (Daemon        *daemon,
+                                              uid_t          uid);
+ 
+ void           user_update_from_pwent       (User          *user,
+                                              struct passwd *pwent,
+                                              struct spwd   *spent);
+-void           user_update_from_keyfile     (User          *user,
+-                                             GKeyFile      *keyfile);
++void           user_update_from_cache       (User *user);
+ void           user_update_local_account_property (User          *user,
+                                                    gboolean       local);
+ void           user_update_system_account_property (User          *user,
+                                                     gboolean       system);
+ gboolean       user_get_cached              (User          *user);
+ void           user_set_cached              (User          *user,
+                                              gboolean       cached);
+ void           user_set_saved               (User          *user,
+                                              gboolean       saved);
+ 
+ void           user_register                (User          *user);
+ void           user_unregister              (User          *user);
+ void           user_changed                 (User          *user);
+ 
+ void           user_save                    (User          *user);
+ 
+ const gchar *  user_get_user_name           (User          *user);
+ gboolean       user_get_system_account      (User          *user);
+ gboolean       user_get_local_account       (User          *user);
+ const gchar *  user_get_object_path         (User          *user);
+ uid_t          user_get_uid                 (User          *user);
+ const gchar *  user_get_shell               (User          *user);
+ 
+ G_END_DECLS
+ 
+ #endif
+-- 
+2.27.0
+

@@ -1,0 +1,195 @@
+From 12127d9c04e8151c51bd14114dce424ff8448345 Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Thu, 9 Sep 2021 09:40:49 -0400
+Subject: [PATCH 2/2] main: Allow cache files to be marked immutable
+
+At the moment, at start up we unconditionally reset permission of all
+cache files in /var/lib/AccountsService/users.  If the mode of the files
+can't be reset, accountsservice fails to start.
+
+But there's a situation where we should proceed anyway: If the
+mode is already correct, and the file is read-only, there is no reason
+to refuse to proceed.
+
+This commit changes the code to explicitly validate the permissions of
+the file before failing.
+---
+ src/main.c | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/src/main.c b/src/main.c
+index 01cb617..36a2d7e 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -16,143 +16,164 @@
+  * along with this program; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+  *
+  * Written by: Matthias Clasen <mclasen@redhat.com>
+  */
+ 
+ #include "config.h"
+ 
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <locale.h>
+ #include <libintl.h>
+ #include <syslog.h>
+ #include <sys/stat.h>
+ #include <errno.h>
+ 
+ #include <glib.h>
+ #include <glib/gi18n.h>
+ #include <glib/gstdio.h>
+ #include <glib-unix.h>
+ 
+ #include "daemon.h"
+ 
+ #define NAME_TO_CLAIM "org.freedesktop.Accounts"
+ 
+ static gboolean
+ ensure_directory (const char  *path,
+                   gint         mode,
+                   GError     **error)
+ {
++        GStatBuf stat_buffer = { 0 };
++
+         if (g_mkdir_with_parents (path, mode) < 0) {
+                 g_set_error (error,
+                              G_FILE_ERROR,
+                              g_file_error_from_errno (errno),
+                              "Failed to create directory %s: %m",
+                              path);
+                 return FALSE;
+         }
+ 
+-        if (g_chmod (path, mode) < 0) {
++        g_chmod (path, mode);
++
++        if (g_stat (path, &stat_buffer) < 0) {
++                g_clear_error (error);
++
+                 g_set_error (error,
+                              G_FILE_ERROR,
+                              g_file_error_from_errno (errno),
+-                             "Failed to change permissions of directory %s: %m",
++                             "Failed to validate permissions of directory %s: %m",
+                              path);
+                 return FALSE;
+         }
+ 
++        if ((stat_buffer.st_mode & ~S_IFMT) != mode) {
++                g_set_error (error,
++                             G_FILE_ERROR,
++                             g_file_error_from_errno (errno),
++                             "Directory %s has wrong mode %o; it should be %o",
++                             path, stat_buffer.st_mode, mode);
++                return FALSE;
++        }
++
+         return TRUE;
+ }
+ 
+ static gboolean
+ ensure_file_permissions (const char  *dir_path,
+                          gint         file_mode,
+                          GError     **error)
+ {
+         GDir *dir = NULL;
+         const gchar *filename;
+         gint errsv = 0;
+ 
+         dir = g_dir_open (dir_path, 0, error);
+         if (dir == NULL)
+                 return FALSE;
+ 
+         while ((filename = g_dir_read_name (dir)) != NULL) {
++                GStatBuf stat_buffer = { 0 };
++
+                 gchar *file_path = g_build_filename (dir_path, filename, NULL);
+ 
+                 g_debug ("Changing permission of %s to %04o", file_path, file_mode);
+-                if (g_chmod (file_path, file_mode) < 0)
++                g_chmod (file_path, file_mode);
++
++                if (g_stat (file_path, &stat_buffer) < 0)
+                         errsv = errno;
+ 
++                if ((stat_buffer.st_mode & ~S_IFMT) != file_mode)
++                        errsv = EACCES;
++
+                 g_free (file_path);
+         }
+ 
+         g_dir_close (dir);
+ 
+         /* Report any errors after all chmod()s have been attempted. */
+         if (errsv != 0) {
+                 g_set_error (error,
+                              G_FILE_ERROR,
+                              g_file_error_from_errno (errsv),
+                              "Failed to change permissions of files in directory %s: %m",
+                              dir_path);
+                 return FALSE;
+         }
+ 
+         return TRUE;
+ }
+ 
+ static void
+ on_bus_acquired (GDBusConnection  *connection,
+                  const gchar      *name,
+                  gpointer          user_data)
+ {
+         GMainLoop *loop = user_data;
+         Daemon *daemon;
+         g_autoptr(GError) error = NULL;
+ 
+         if (!ensure_directory (ICONDIR, 0775, &error) ||
+             !ensure_directory (USERDIR, 0700, &error) ||
+             !ensure_file_permissions (USERDIR, 0600, &error)) {
+                 g_printerr ("%s\n", error->message);
+                 g_main_loop_quit (loop);
+                 return;
+         }
+ 
+         daemon = daemon_new ();
+         if (daemon == NULL) {
+                 g_printerr ("Failed to initialize daemon\n");
+                 g_main_loop_quit (loop);
+                 return;
+         }
+-
+         openlog ("accounts-daemon", LOG_PID, LOG_DAEMON);
+         syslog (LOG_INFO, "started daemon version %s", VERSION);
+         closelog ();
+         openlog ("accounts-daemon", 0, LOG_AUTHPRIV);
+ }
+ 
+ static void
+ on_name_lost (GDBusConnection  *connection,
+               const gchar      *name,
+               gpointer          user_data)
+ {
+         GMainLoop *loop = user_data;
+ 
+         g_debug ("got NameLost, exiting");
+         g_main_loop_quit (loop);
+ }
+ 
+ static gboolean debug;
+ 
+ static void
+ on_log_debug (const gchar *log_domain,
+               GLogLevelFlags log_level,
+               const gchar *message,
+               gpointer user_data)
+ {
+         g_autoptr(GString) string = NULL;
+         const gchar *progname;
+         int ret G_GNUC_UNUSED;
+ 
+         string = g_string_new (NULL);
+-- 
+2.31.1
+
