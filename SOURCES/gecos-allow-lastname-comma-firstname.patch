@@ -1,0 +1,54 @@
+From 091513774c7049618dcc180a7345ec2acfdb7b26 Mon Sep 17 00:00:00 2001
+From: Adrian Vovk <adrianvovk@gmail.com>
+Date: Fri, 18 Apr 2025 17:36:52 -0400
+Subject: [PATCH] Allow "Lastname, Firstname" in /etc/passwd
+
+While accountsservice itself doesn't allow this to be set, other
+programs may write these values in /etc/passwd. For presentation
+purposes we display "Lastname, Firstname" names. We use a heuristic to
+determine whether we're looking at separated GECOS fields or
+"Lastname, Firstname".
+
+Resolves: https://issues.redhat.com/browse/RHEL-12265
+---
+ src/user.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/user.c b/src/user.c
+index 1fa047e..da6428c 100644
+--- a/src/user.c
++++ b/src/user.c
+@@ -429,6 +429,7 @@ user_update_from_pwent (User          *user,
+         g_clear_pointer (&user->gecos, g_free);
+         if (pwent->pw_gecos && pwent->pw_gecos[0] != '\0') {
+                 gchar *first_comma = NULL;
++                gchar *second_comma = NULL;
+                 gchar *valid_utf8_name = NULL;
+ 
+                 if (g_utf8_validate (pwent->pw_gecos, -1, NULL)) {
+@@ -442,8 +443,21 @@ user_update_from_pwent (User          *user,
+                 }
+ 
+                 if (first_comma) {
+-                        real_name = g_strndup (valid_utf8_name,
+-                                               (first_comma - valid_utf8_name));
++                        second_comma = g_utf8_strchr (first_comma + 1, -1, ',');
++
++                        /* Sometimes, /etc/password will contain names in `LastName, FirstName` format.
++                         * This is, strictly speaking, incorrect because GECOS fields are separated by
++                         * commas. However, we can pretty reliably guess when this has happened. If
++                         * using GECOS fields, you wouldn't start the office number with a space. When
++                         * using a `LastName, FirstName` format, you wouldn't have more than one comma.
++                         * So, if we detect something that _looks_ like `LastName, FirstName`, let's use
++                         * it for display purposes. */
++                        if (first_comma[1] == ' ' && !second_comma) {
++                                real_name = g_strdup (valid_utf8_name);
++                        } else {
++                                real_name = g_strndup (valid_utf8_name,
++                                                       (first_comma - valid_utf8_name));
++                        }
+                 } else if (valid_utf8_name) {
+                         real_name = g_strdup (valid_utf8_name);
+                 } else {
+-- 
+GitLab

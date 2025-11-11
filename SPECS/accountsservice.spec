@@ -1,6 +1,6 @@
 Name:           accountsservice
 Version:        23.13.9
-Release:        6%{?dist}
+Release:        8%{?dist}
 Summary:        D-Bus interfaces for querying and manipulating user account information
 License:        GPL-3.0-or-later
 URL:            https://www.freedesktop.org/wiki/Software/AccountsService/
@@ -20,6 +20,7 @@ BuildRequires:  git
 BuildRequires:  meson
 BuildRequires:  vala
 BuildRequires:  python3-dbusmock
+BuildRequires:  libxcrypt-devel
 
 Requires:       polkit
 Requires:       shadow-utils
@@ -28,6 +29,8 @@ Requires:       shadow-utils
 # https://bugzilla.redhat.com/show_bug.cgi?id=2185850
 Patch10001:     0001-mocklibc-Fix-compiler-warning.patch
 Patch10002:     0002-user-manager-Fix-another-compiler-warning.patch
+Patch10003:     0003-act-user-Use-the-reentrant-interfaces-of-crypt-_gens.patch
+Patch10004:     gecos-allow-lastname-comma-firstname.patch
 
 %description
 The accountsservice project provides a set of D-Bus interfaces for
@@ -114,6 +117,16 @@ mkdir -p $RPM_BUILD_ROOT%{_datadir}/accountsservice/interfaces/
 %{_datadir}/vala/vapi/accountsservice.*
 
 %changelog
+* Fri Apr 25 2025 Adrian Vovk <avovk@redhat.com> - 23.13.9-8
+
+- Allow "Lastname, Firstname" in /etc/passwd
+  Resolves: RHEL-12265
+
+* Fri Apr 18 2025 Adrian Vovk <avovk@redhat.com> - 23.13.9-7
+
+- Backport changes from Fedora 40
+  Resolves: RHEL-78526
+
 * Tue Oct 29 2024 Troy Dawson <tdawson@redhat.com> - 23.13.9-6
 - Bump release for October 2024 mass rebuild:
   Resolves: RHEL-64018
